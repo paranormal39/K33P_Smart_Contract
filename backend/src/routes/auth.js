@@ -7,6 +7,7 @@ import { createRateLimiter } from '../middleware/rate-limiter.js';
 import { K33PError, ErrorCodes, SuccessCodes, asyncHandler, ResponseUtils } from '../middleware/error-handler.js';
 import { hashPhone, hashBiometric, hashPasskey } from '../utils/hash.js';
 import { generateZkCommitment, generateZkProof, verifyZkProof as verifyZkProofUtil } from '../utils/zk.js';
+import { verifyLoginForUser, registerIdentityForUser } from '../services/nok-service.js';
 import { signupTxBuilder } from '../utils/lucid.js';
 import * as iagon from '../utils/iagon.js';
 import { storageService } from '../services/storage-abstraction.js';
@@ -1161,6 +1162,18 @@ async function handleSignup(req, res, defaultVerificationMethod = null, defaultB
         // Don't fail signup if ZK proof storage fails
       }
 
+      // Register the commitment on-chain (Midnight) so a later login can be
+      // verified with a real ZK proof. This is the authoritative identity
+      // record; the DB row above is a cache/audit copy.
+      try {
+        await registerIdentityForUser(newUser.user_id, zkCommitment);
+        console.log('Identity commitment registered on Midnight for new user');
+      } catch (regError) {
+        console.error('Failed to register identity on Midnight:', regError);
+        // Surface as a soft failure: the user exists, but must retry
+        // registration before login verification will succeed.
+      }
+
       console.log('Generating JWT token for new user...');
       const token = jwt.sign(
         {
@@ -1335,10 +1348,20 @@ router.post('/login', verifyZkProof, async (req, res) => {
     if (!user) {
       return ResponseUtils.error(res, ErrorCodes.USER_NOT_FOUND);
     }
-    // Verify ZK proof (simulated)
-    if (user.zkCommitment !== commitment) {
-      return ResponseUtils.error(res, ErrorCodes.ZK_PROOF_INVALID);
+
+    // Verify the ZK proof for real: produce a Midnight proof that the supplied
+    // commitment matches the one registered on-chain for this user at signup.
+    const loginUserId = user.user_id || user.userId || user.id;
+    try {
+      const verification = await verifyLoginForUser(loginUserId, commitment);
+      if (!verification?.verified) {
+        return ResponseUtils.error(res, ErrorCodes.ZK_PROOF_INVALID);
+      }
+    } catch (zkErr) {
+      console.error('On-chain ZK login verification failed:', zkErr);
+      return ResponseUtils.error(res, ErrorCodes.ZK_PROOF_INVALID, null, 'ZK login verification failed');
     }
+
     // Generate JWT token
     const token = jwt.sign(
       { id: user.id, walletAddress: user.walletAddress },
