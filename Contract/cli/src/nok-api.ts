@@ -32,6 +32,7 @@ export interface NokLedgerState {
   admin: Uint8Array;
   round: bigint;
   registeredCount: bigint;
+  registeredIdentityCount: bigint;
 }
 
 // ─── Compiled contract definition ──────────────────────────────────────────────
@@ -160,6 +161,33 @@ export async function approveNokLogin(
   return (result as any).public?.result ?? true;
 }
 
+// ─── Identity write ops (K33P authentication) ────────────────────────────────────
+
+/** Register a credential commitment for a K33P user. Both args are Field values. */
+export async function registerIdentity(
+  deployed: DeployedNokContract,
+  userId: bigint,
+  commitment: bigint,
+  log: Logger,
+): Promise<void> {
+  log.info(`Registering identity for user ${userId.toString().slice(0, 12)}...`);
+  await (deployed.callTx as any).register_identity(userId, commitment);
+  log.info('Identity registered');
+}
+
+/** Verify a login by producing a ZK proof that the supplied commitment matches. */
+export async function verifyLogin(
+  deployed: DeployedNokContract,
+  userId: bigint,
+  commitment: bigint,
+  log: Logger,
+): Promise<boolean> {
+  log.info(`Verifying login for user ${userId.toString().slice(0, 12)}...`);
+  const result = await (deployed.callTx as any).verify_login(userId, commitment);
+  log.info('Login verified');
+  return (result as any).public?.result ?? true;
+}
+
 // ─── Read ops ───────────────────────────────────────────────────────────────────
 
 export async function getNokLedgerState(
@@ -176,6 +204,7 @@ export async function getNokLedgerState(
     admin: ls.admin,
     round: ls.round,
     registeredCount: ls.noks.size(),
+    registeredIdentityCount: ls.identities.size(),
   };
 }
 
@@ -191,4 +220,18 @@ export async function isNokRegistered(
   if (!contractState) return false;
   const ls = Nok.ledger(contractState.data);
   return ls.noks.member(ownerIdentifier);
+}
+
+/** Read-only: is a K33P identity registered for this user? */
+export async function isIdentityRegistered(
+  providers: NokProviders,
+  contractAddress: string,
+  userId: bigint,
+  _log: Logger,
+): Promise<boolean> {
+  assertIsContractAddress(contractAddress);
+  const contractState = await providers.publicDataProvider.queryContractState(contractAddress as ContractAddress);
+  if (!contractState) return false;
+  const ls = Nok.ledger(contractState.data);
+  return ls.identities.member(userId);
 }

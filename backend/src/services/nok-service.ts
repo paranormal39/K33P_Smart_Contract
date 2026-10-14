@@ -33,8 +33,16 @@ import {
   approveNokLogin,
   isNokRegistered,
   getNokLedgerState,
+  registerIdentity,
+  verifyLogin,
+  isIdentityRegistered,
 } from '@k33p/nok-cli/dist/nok-api.js';
-import { ownerIdentifierToField, nokHashToField } from '@k33p/nok-cli/dist/hash.js';
+import {
+  ownerIdentifierToField,
+  nokHashToField,
+  userIdentifierToField,
+  credentialCommitmentToField,
+} from '@k33p/nok-cli/dist/hash.js';
 import { loadConfig } from '@k33p/nok-cli/dist/config.js';
 import { buildWalletAndWaitForFunds } from '@k33p/nok-cli/dist/wallet.js';
 
@@ -130,5 +138,50 @@ export async function getNokContractState() {
     adminPubKey: Buffer.from(state.admin).toString('hex'),
     round: state.round.toString(),
     registeredCount: state.registeredCount.toString(),
+    registeredIdentityCount: state.registeredIdentityCount.toString(),
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Identity registry (K33P authentication) — real server-side ZK
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// These wrap the identity circuits on the SAME deployed contract as NOK. The
+// commitment is a string produced by the backend from the user's credential
+// hashes; both register and verify derive the identical Field from it (the
+// HMAC salt comes from NOK_HASH_SALT / NOK_ADMIN_SECRET via the hash helper),
+// so a login proof succeeds iff the presented credentials match what was
+// committed at signup.
+
+export interface IdentityResult {
+  userId: string;
+  userField: string;
+  registered?: boolean;
+  verified?: boolean;
+}
+
+/** Register a user's credential commitment on-chain at signup. Admin write op. */
+export async function registerIdentityForUser(userId: string, commitment: string): Promise<IdentityResult> {
+  const { deployed } = await getContext();
+  const userField = userIdentifierToField(userId);
+  const commitmentField = credentialCommitmentToField(commitment);
+  await registerIdentity(deployed, userField, commitmentField, nokLogger);
+  return { userId, userField: userField.toString(), registered: true };
+}
+
+/** Verify a login by producing a real ZK proof that the commitment matches. */
+export async function verifyLoginForUser(userId: string, commitment: string): Promise<IdentityResult> {
+  const { deployed } = await getContext();
+  const userField = userIdentifierToField(userId);
+  const commitmentField = credentialCommitmentToField(commitment);
+  const verified = await verifyLogin(deployed, userField, commitmentField, nokLogger);
+  return { userId, userField: userField.toString(), verified };
+}
+
+/** Read-only: is a K33P identity registered on-chain for this user? */
+export async function checkIdentityRegisteredForUser(userId: string): Promise<IdentityResult> {
+  const { providers, contractAddress } = await getContext();
+  const userField = userIdentifierToField(userId);
+  const registered = await isIdentityRegistered(providers, contractAddress, userField, nokLogger);
+  return { userId, userField: userField.toString(), registered };
 }
