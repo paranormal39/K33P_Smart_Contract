@@ -119,3 +119,5 @@ cd ../Contract && npm run deploy          # redeploy combined contract (preview)
   optional `DB_SSL*`; plus the Midnight client vars `NOK_CONTRACT_ADDRESS`,
   `NOK_ADMIN_SECRET`, `NOK_WALLET_SEED`, `PROOF_SERVER_URL`, `MIDNIGHT_NETWORK`
   (and `MIDNIGHT_BLOCKFROST_PROJECT_ID` on mainnet). See `backend/.env.example`.
+
+
