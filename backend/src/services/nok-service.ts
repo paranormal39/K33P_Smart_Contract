@@ -95,6 +95,26 @@ async function getContext() {
   return initPromise;
 }
 
+// ─── Write queue ──────────────────────────────────────────────────────────────
+//
+// Every write circuit is a fee-paying transaction from ONE operator wallet. On
+// mainnet that wallet typically holds a single DUST coin, and the wallet SDK
+// marks it `pending` from balancing until the tx is finalized (1–5 min). Two
+// concurrent writes therefore cannot both be balanced: the second fails with
+// "could not balance dust". All writes are serialized through this queue so
+// they run strictly one at a time, in arrival order. A failed write does not
+// block the ones behind it.
+
+let writeChain: Promise<unknown> = Promise.resolve();
+
+function enqueueWrite<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  const run = writeChain.then(fn, fn);
+  writeChain = run.catch((err) => {
+    logger.error(`[NOK] write "${label}" failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+  return run;
+}
+
 export interface NokResult {
   userId: string;
   ownerIdentifier: string;
@@ -104,19 +124,23 @@ export interface NokResult {
 
 /** Register a next-of-kin record for a K33P user. Admin write op. */
 export async function registerNokForUser(userId: string, nokIdentifier: string): Promise<NokResult> {
-  const { deployed } = await getContext();
   const ownerField = ownerIdentifierToField(userId);
   const nokField = nokHashToField(nokIdentifier);
-  await registerNok(deployed, ownerField, nokField, nokLogger);
+  await enqueueWrite(`register_nok:${userId}`, async () => {
+    const { deployed } = await getContext();
+    await registerNok(deployed, ownerField, nokField, nokLogger);
+  });
   return { userId, ownerIdentifier: ownerField.toString(), registered: true };
 }
 
 /** Approve a NOK-initiated login for a K33P user. Admin write op. */
 export async function approveNokLoginForUser(userId: string, nokIdentifier: string): Promise<NokResult> {
-  const { deployed } = await getContext();
   const ownerField = ownerIdentifierToField(userId);
   const nokField = nokHashToField(nokIdentifier);
-  const approved = await approveNokLogin(deployed, ownerField, nokField, nokLogger);
+  const approved = await enqueueWrite(`approve_nok_login:${userId}`, async () => {
+    const { deployed } = await getContext();
+    return approveNokLogin(deployed, ownerField, nokField, nokLogger);
+  });
   return { userId, ownerIdentifier: ownerField.toString(), approved };
 }
 
@@ -162,19 +186,69 @@ export interface IdentityResult {
 
 /** Register a user's credential commitment on-chain at signup. Admin write op. */
 export async function registerIdentityForUser(userId: string, commitment: string): Promise<IdentityResult> {
-  const { deployed } = await getContext();
   const userField = userIdentifierToField(userId);
   const commitmentField = credentialCommitmentToField(commitment);
-  await registerIdentity(deployed, userField, commitmentField, nokLogger);
+  await enqueueWrite(`register_identity:${userId}`, async () => {
+    const { deployed } = await getContext();
+    await registerIdentity(deployed, userField, commitmentField, nokLogger);
+  });
   return { userId, userField: userField.toString(), registered: true };
+}
+
+export type IdentityRegistrationState = 'pending' | 'registered' | 'failed';
+
+export interface IdentityRegistrationStatus {
+  userId: string;
+  state: IdentityRegistrationState;
+  queuedAt: string;
+  completedAt?: string;
+  error?: string;
+}
+
+// In-memory status of background registrations. Lost on restart — the
+// authoritative answer is always `checkIdentityRegisteredForUser` (on-chain).
+const identityRegistrations = new Map<string, IdentityRegistrationStatus>();
+
+/**
+ * Queue a user's identity registration WITHOUT waiting for the on-chain
+ * transaction. Returns immediately so request handlers (signup) can respond
+ * while the proof + mainnet inclusion (1–5 min) happen in the background.
+ * Use `getIdentityRegistrationStatus` / `checkIdentityRegisteredForUser` to
+ * find out when it has landed.
+ */
+export function enqueueIdentityRegistration(userId: string, commitment: string): IdentityRegistrationStatus {
+  const status: IdentityRegistrationStatus = { userId, state: 'pending', queuedAt: new Date().toISOString() };
+  identityRegistrations.set(userId, status);
+  logger.info(`[NOK] Queued identity registration for ${userId}`);
+  registerIdentityForUser(userId, commitment).then(
+    () => {
+      status.state = 'registered';
+      status.completedAt = new Date().toISOString();
+      logger.info(`[NOK] Identity registered on Midnight for ${userId}`);
+    },
+    (err) => {
+      status.state = 'failed';
+      status.completedAt = new Date().toISOString();
+      status.error = err instanceof Error ? err.message : String(err);
+      logger.error(`[NOK] Background identity registration failed for ${userId}: ${status.error}`);
+    },
+  );
+  return status;
+}
+
+/** Status of a background registration queued in this process, if any. */
+export function getIdentityRegistrationStatus(userId: string): IdentityRegistrationStatus | undefined {
+  return identityRegistrations.get(userId);
 }
 
 /** Verify a login by producing a real ZK proof that the commitment matches. */
 export async function verifyLoginForUser(userId: string, commitment: string): Promise<IdentityResult> {
-  const { deployed } = await getContext();
   const userField = userIdentifierToField(userId);
   const commitmentField = credentialCommitmentToField(commitment);
-  const verified = await verifyLogin(deployed, userField, commitmentField, nokLogger);
+  const verified = await enqueueWrite(`verify_login:${userId}`, async () => {
+    const { deployed } = await getContext();
+    return verifyLogin(deployed, userField, commitmentField, nokLogger);
+  });
   return { userId, userField: userField.toString(), verified };
 }
 

@@ -7,7 +7,12 @@ import { createRateLimiter } from '../middleware/rate-limiter.js';
 import { K33PError, ErrorCodes, SuccessCodes, asyncHandler, ResponseUtils } from '../middleware/error-handler.js';
 import { hashPhone, hashBiometric, hashPasskey } from '../utils/hash.js';
 import { generateZkCommitment, generateZkProof, verifyZkProof as verifyZkProofUtil } from '../utils/zk.js';
-import { verifyLoginForUser, registerIdentityForUser } from '../services/nok-service.js';
+import {
+  verifyLoginForUser,
+  enqueueIdentityRegistration,
+  getIdentityRegistrationStatus,
+  checkIdentityRegisteredForUser,
+} from '../services/nok-service.js';
 import { signupTxBuilder } from '../utils/lucid.js';
 import * as iagon from '../utils/iagon.js';
 import { storageService } from '../services/storage-abstraction.js';
@@ -1165,14 +1170,13 @@ async function handleSignup(req, res, defaultVerificationMethod = null, defaultB
       // Register the commitment on-chain (Midnight) so a later login can be
       // verified with a real ZK proof. This is the authoritative identity
       // record; the DB row above is a cache/audit copy.
-      try {
-        await registerIdentityForUser(newUser.user_id, zkCommitment);
-        console.log('Identity commitment registered on Midnight for new user');
-      } catch (regError) {
-        console.error('Failed to register identity on Midnight:', regError);
-        // Surface as a soft failure: the user exists, but must retry
-        // registration before login verification will succeed.
-      }
+      //
+      // NOT awaited: on mainnet the proof + block inclusion take 1–5 minutes,
+      // far beyond the HTTP proxy timeout. The write is queued (serialized
+      // through the single operator wallet) and the response goes out now.
+      // Poll GET /api/auth/identity-status/:userId to see when it lands.
+      const identityRegistration = enqueueIdentityRegistration(newUser.user_id, zkCommitment);
+      console.log('Identity commitment registration queued on Midnight for new user');
 
       console.log('Generating JWT token for new user...');
       const token = jwt.sign(
@@ -1202,6 +1206,7 @@ async function handleSignup(req, res, defaultVerificationMethod = null, defaultB
         verificationMethod,
         authMethods: authMethods,
         zkCommitment: zkCommitment,
+        identityRegistration: identityRegistration.state,
         requiresDeposit: verificationMethod === 'phone',
         depositAddress: finalUserAddress,
         authDetails: {
@@ -1895,6 +1900,44 @@ router.post('/verify', async (req, res) => {
     }
   } catch (error) {
     console.error('Token verification error:', error);
+    return ResponseUtils.error(res, ErrorCodes.SERVER_ERROR);
+  }
+});
+
+/**
+ * @route GET /api/auth/identity-status/:userId
+ * @desc Has the user's identity commitment landed on Midnight yet? Signup
+ *       queues the on-chain registration and returns immediately; the mobile
+ *       app polls this until `state` is `registered`.
+ *       Response: { state: 'pending' | 'registered' | 'failed' | 'unknown', onChain, queuedAt?, completedAt?, error? }
+ * @access Private
+ */
+router.get('/identity-status/:userId', verifyToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) return ResponseUtils.error(res, ErrorCodes.IDENTIFIER_REQUIRED);
+
+    // In-process queue status (fast; lost on restart) ...
+    const queued = getIdentityRegistrationStatus(userId);
+    // ... reconciled with the chain, which is the source of truth.
+    let onChain = false;
+    try {
+      onChain = (await checkIdentityRegisteredForUser(userId)).registered === true;
+    } catch (chainErr) {
+      console.error('identity-status: on-chain check failed:', chainErr?.message ?? chainErr);
+    }
+
+    const state = onChain ? 'registered' : (queued?.state ?? 'unknown');
+    return ResponseUtils.success(res, SuccessCodes.DATA_RETRIEVED, {
+      userId,
+      state,
+      onChain,
+      queuedAt: queued?.queuedAt,
+      completedAt: queued?.completedAt,
+      error: queued?.state === 'failed' ? queued.error : undefined
+    });
+  } catch (error) {
+    console.error('identity-status error:', error);
     return ResponseUtils.error(res, ErrorCodes.SERVER_ERROR);
   }
 });

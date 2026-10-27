@@ -261,32 +261,39 @@ DUST fee, submission over Blockfrost, and `midnight-js` waiting for
 finalization on the indexer. From `cli/src/deploy.ts`/`wallet.ts` experience,
 normal completion is **1–5 minutes**, with a 30-minute TTL worst case.
 
-`auth.js` currently awaits these inline:
+How `auth.js` handles them:
 
-- signup → `registerIdentityForUser()` (soft-fails: user is created, error logged)
-- login → `verifyLoginForUser()` (hard-fails: returns `ZK_PROOF_INVALID`)
-
-On preview this was tolerable; on mainnet it means a login HTTP request blocks
-for minutes and costs DUST. Decide explicitly:
+- **signup** → `enqueueIdentityRegistration()` — **not awaited**. The 201 with
+  the JWT goes out immediately with `identityRegistration: "pending"`; the
+  on-chain write runs in the background through the write queue (6.2). The
+  mobile app polls `GET /api/auth/identity-status/:userId` (Bearer) until
+  `state` is `registered` (`failed` carries the error; `unknown` means the
+  process restarted before it landed — reconcile with `onChain`).
+- **login** → `verifyLoginForUser()` — still awaited inline (hard-fails with
+  `ZK_PROOF_INVALID`). On mainnet this blocks the login request for minutes and
+  costs DUST per login. Decide explicitly:
 
 | Approach | Change | Trade-off |
 |---|---|---|
-| Keep synchronous | none | Simplest; unacceptable UX for login |
-| Queue writes, respond immediately | wrap `nok-service` writes in a single-concurrency job queue; mobile polls a status endpoint | Still one tx per login; no user-facing latency |
+| Keep synchronous | none | Simplest; unacceptable UX for login behind a ~100 s proxy timeout |
+| Queue + poll (as signup does) | return a `pending` login and poll a status endpoint | Still one tx per login; no HTTP timeout |
 | Login = proof only, no tx | verify the commitment against `identities` via the read path (`isIdentityRegistered` + compare stored `commitment`) and reserve `verify_login` for high-value actions | Near-instant login; loses the per-login on-chain audit stamp |
 
-Whichever you choose, the writes **must be serialized** (see 6.2).
+### 6.2 All writes are serialized through one wallet
 
-### 6.2 Serialize all writes through one wallet
+Every write in `nok-service.ts` (`register_nok`, `approve_nok_login`,
+`register_identity`, `verify_login`) goes through `enqueueWrite()`, a
+single-concurrency promise chain, so transactions are built and submitted
+strictly one at a time in arrival order. With one DUST coin a second concurrent
+tx could otherwise not be balanced (`Insufficient Funds: could not balance
+dust`) until the first finalized. A failed write does not block the ones behind
+it. The queue is per process — run **one** backend instance against the
+operator wallet (or move the queue to a shared job store before scaling out).
 
-`nok-service.ts` caches one `deployed` handle and lets concurrent requests call
-`callTx.*` in parallel. With one DUST coin, the second concurrent tx cannot be
-balanced (`Insufficient Funds: could not balance dust`) until the first is
-finalized; a failed/expired tx can also leave the coin marked `pending` in the
-persisted snapshot. Add a mutex/queue around every write in `nok-service.ts`,
-and reuse the CLI's safeguards (`waitForTip`, `waitForSpendableDust`,
-`withTxCheckpoint` from `wallet.ts`) before each tx — `deploy.ts` shows the
-pattern in `readyForTx()`.
+Still worth adding before each tx: the CLI's `waitForTip` /
+`waitForSpendableDust` / `withTxCheckpoint` safeguards from `wallet.ts`
+(`deploy.ts` shows the pattern in `readyForTx()`), which protect against a
+stale DUST view and a coin left `pending` by a dead tx.
 
 ### 6.3 Cold start is slow; make it a warm-up, not a request
 
@@ -396,6 +403,7 @@ backend. To light up the existing NOK screens:
 
 | Screen flow | Call |
 |---|---|
+| `did-creation` → after `POST /api/auth/signup` returns | poll `GET /api/auth/identity-status/:userId` (Bearer) until `state: "registered"`; show "securing your identity on Midnight" meanwhile |
 | `profile/nok-setup/register-*` → save NOK | `POST /api/nok/register` `{ nokIdentifier }` (Bearer) |
 | Show "NOK configured" badge | `GET /api/nok/check/:userId` |
 | NOK-initiated recovery/login | `POST /api/nok/approve-login` `{ userId, nokIdentifier }` |
@@ -414,7 +422,8 @@ call (ties into the queue decision in §6.1).
 | `MIDNIGHT_BLOCKFROST_PROJECT_ID is required for mainnet` | Token missing, or `MIDNIGHT_NETWORK=mainnet` set without it | Add a Midnight **Mainnet** Blockfrost token |
 | Wallet `DISCONNECTED … for 60s` | Preview/preprod token used on mainnet (403), or Blockfrost outage | Use a mainnet token; run the health check |
 | `No spendable DUST in this wallet` | Wrong seed (not the deploy wallet), DUST still maturing, or a coin locked by a dead tx in the snapshot | Use the deploy seed; wait; or restart once with `WALLET_STATE_RESET=1` |
-| `Insufficient Funds: could not balance dust` on a write | Concurrent writes / admin CLI running in parallel | Serialize writes (§6.2); stop the CLI |
+| `Insufficient Funds: could not balance dust` on a write | Admin CLI or a second backend instance writing from the same wallet in parallel | Stop the CLI; run a single backend instance (§6.2) |
+| Signup returns `identityRegistration: "pending"` but `identity-status` stays `pending` for 10+ min | Queue is working through earlier writes, or the proof server / Blockfrost is slow | Check `[NOK]` logs for the queued write; `state: "failed"` carries the error |
 | `ECONNREFUSED` / proof step hangs | Proof server down or unreachable from the host | Fix `MIDNIGHT_PROOF_SERVER_URL`; check `/health` |
 | `joinNok` fails / proofs rejected after a rebuild | `managed/nok` recompiled → verifier keys differ from chain | Restore the deploy artefact (§4); never `npm run compact` for mainnet |
 | Login returns `ZK_PROOF_INVALID` for every existing user | Users registered on preview; mainnet `identities` is empty | Backfill or lazy re-register (§6.5) |
